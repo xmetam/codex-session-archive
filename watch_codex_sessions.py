@@ -30,6 +30,7 @@ TERMINAL_TASK_EVENTS = {"task_complete", "task_failed", "task_cancelled"}
 DEFAULT_EVENTS_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024
 DEFAULT_PLAN_MAX_BYTES = 8 * 1024 * 1024
+THREADS_TABLE_COLUMNS = {"id", "title", "source", "rollout_path", "agent_nickname", "agent_role", "archived"}
 
 
 @dataclass(frozen=True)
@@ -298,6 +299,7 @@ class CodexArchiveWatcher:
         auto_git: bool = False,
         git_remote: str = "origin",
         git_commit_interval_seconds: int = 300,
+        state_db_path: Optional[Path] = None,
     ) -> None:
         self.codex_home = codex_home
         self.output_dir = output_dir
@@ -321,7 +323,9 @@ class CodexArchiveWatcher:
         self.archive_audit_report_path = self.reports_dir / "archive-audit.md"
         self.filename_audit_report_path = self.reports_dir / "filename-audit.md"
         self.session_index_path = self.codex_home / "session_index.jsonl"
-        self.state_db_path = self.codex_home / "state_5.sqlite"
+        self.state_db_path = (
+            state_db_path.expanduser().resolve() if state_db_path is not None else (self.codex_home / "state_5.sqlite")
+        )
 
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +357,11 @@ class CodexArchiveWatcher:
                 "last_discovered_source_count": 0,
                 "last_new_source_count": 0,
                 "last_processed_source_count": 0,
+                "state_db_path": "",
+                "last_state_db_status": "unknown",
+                "last_state_db_error": "",
+                "last_state_db_checked_at": "",
+                "last_state_db_schema_ok": None,
             },
         )
         manifest.setdefault("version", MANIFEST_VERSION)
@@ -368,6 +377,11 @@ class CodexArchiveWatcher:
         manifest.setdefault("last_discovered_source_count", 0)
         manifest.setdefault("last_new_source_count", 0)
         manifest.setdefault("last_processed_source_count", 0)
+        manifest.setdefault("state_db_path", "")
+        manifest.setdefault("last_state_db_status", "unknown")
+        manifest.setdefault("last_state_db_error", "")
+        manifest.setdefault("last_state_db_checked_at", "")
+        manifest.setdefault("last_state_db_schema_ok", None)
         if not isinstance(manifest.get("known_sources"), dict):
             manifest["known_sources"] = {}
         return manifest
@@ -407,6 +421,7 @@ class CodexArchiveWatcher:
         self.manifest["generated_at"] = utc_now()
         self.manifest["session_count"] = len(list(self.session_states_dir.glob("*.json")))
         self.manifest["plan_count"] = len(self.plan_manifest)
+        self.manifest["state_db_path"] = str(self.state_db_path)
         write_json(self.manifest_path, self.manifest)
 
     def save_plan_manifest(self) -> None:
@@ -433,10 +448,30 @@ class CodexArchiveWatcher:
     def write_session_state(self, session_id: str, state: Dict[str, Any]) -> None:
         write_json(self.session_state_path(session_id), state)
 
+    def note_state_db_status(self, status: str, error: str = "", schema_ok: Optional[bool] = None) -> None:
+        self.manifest["last_state_db_status"] = status
+        self.manifest["last_state_db_error"] = error
+        self.manifest["last_state_db_checked_at"] = utc_now()
+        self.manifest["last_state_db_schema_ok"] = schema_ok
+
+    def validate_threads_table(self, conn: sqlite3.Connection) -> Tuple[bool, str]:
+        try:
+            rows = conn.execute("PRAGMA table_info(threads)").fetchall()
+        except sqlite3.Error as exc:
+            return False, f"pragma table_info failed: {exc}"
+        if not rows:
+            return False, "threads table not found"
+        columns = {str(row[1]) for row in rows if len(row) > 1}
+        missing = sorted(THREADS_TABLE_COLUMNS - columns)
+        if missing:
+            return False, f"threads table missing columns: {', '.join(missing)}"
+        return True, ""
+
     def load_thread_registry(self, force_refresh: bool = False) -> Dict[str, ThreadInfo]:
         session_index = load_session_index(self.session_index_path)
         registry: Dict[str, ThreadInfo] = {}
         if not self.state_db_path.exists():
+            self.note_state_db_status("missing", "state db file not found", schema_ok=None)
             return registry
         state_db_mtime_ns = self.state_db_path.stat().st_mtime_ns
         if (
@@ -450,8 +485,16 @@ class CodexArchiveWatcher:
             "SELECT id, title, source, rollout_path, agent_nickname, agent_role, archived "
             "FROM threads"
         )
-        conn = sqlite3.connect(self.state_db_path)
         try:
+            conn = sqlite3.connect(self.state_db_path)
+        except sqlite3.Error as exc:
+            self.note_state_db_status("error", f"connect failed: {exc}", schema_ok=None)
+            return registry
+        try:
+            schema_ok, schema_error = self.validate_threads_table(conn)
+            if not schema_ok:
+                self.note_state_db_status("schema_error", schema_error, schema_ok=False)
+                return registry
             for row in conn.execute(query):
                 session_id, title, source, rollout_path, agent_nickname, agent_role, archived = row
                 if not isinstance(session_id, str) or not session_id:
@@ -477,6 +520,10 @@ class CodexArchiveWatcher:
                     rollout_path=str(rollout_path) if rollout_path else None,
                     archived=bool(archived),
                 )
+            self.note_state_db_status("ok", "", schema_ok=True)
+        except sqlite3.Error as exc:
+            self.note_state_db_status("error", f"query failed: {exc}", schema_ok=False)
+            return {}
         finally:
             conn.close()
 
@@ -1195,6 +1242,10 @@ class CodexArchiveWatcher:
             "# Archive Audit",
             "",
             f"- Generated At: {utc_now()}",
+            f"- State DB Path: {self.manifest.get('state_db_path') or self.state_db_path}",
+            f"- State DB Status: {self.manifest.get('last_state_db_status') or 'unknown'}",
+            f"- State DB Schema OK: {self.manifest.get('last_state_db_schema_ok')}",
+            f"- State DB Checked At: {self.manifest.get('last_state_db_checked_at') or 'n/a'}",
             f"- Last Discovery Mode: {self.manifest.get('last_discovery_mode') or 'unknown'}",
             f"- Last Full Scan At: {self.manifest.get('last_full_scan_at') or 'n/a'}",
             f"- Last Incremental Scan At: {self.manifest.get('last_incremental_scan_at') or 'n/a'}",
@@ -1211,6 +1262,9 @@ class CodexArchiveWatcher:
             f"- Parent Link Mismatches: {len(parent_mismatches)}",
             "",
         ]
+        state_db_error = str(self.manifest.get("last_state_db_error") or "").strip()
+        if state_db_error:
+            lines.extend(["## State DB Note", "", f"- {state_db_error}", ""])
 
         for title, values in (
             ("Missing Sessions", missing_sessions),
@@ -1414,6 +1468,7 @@ class CodexArchiveWatcher:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Archive Codex Desktop sessions and proposed plans")
     parser.add_argument("--codex-home", type=Path, default=default_codex_home(), help="Codex home path")
+    parser.add_argument("--state-db-path", type=Path, default=None, help="Override the Codex SQLite state database path")
     parser.add_argument("--output-dir", type=Path, default=Path("output/codex-archive"), help="Archive output directory")
     parser.add_argument("--poll-seconds", type=float, default=1.0, help="Polling interval for follow mode")
     parser.add_argument("--events-max-bytes", type=int, default=DEFAULT_EVENTS_MAX_BYTES, help="Max bytes per events part")
@@ -1462,6 +1517,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         auto_git=args.auto_git,
         git_remote=args.git_remote,
         git_commit_interval_seconds=args.git_commit_interval_seconds,
+        state_db_path=args.state_db_path,
     )
 
     if args.verify_retention:

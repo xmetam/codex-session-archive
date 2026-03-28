@@ -33,6 +33,10 @@ English README: [README.md](./README.md)
 - `~/.codex/archived_sessions/**/*.jsonl`
 - `~/.codex/state_5.sqlite`
 
+SQLite 状态库路径也可以通过参数覆盖：
+
+- `--state-db-path /path/to/state.sqlite`
+
 用途分工：
 
 - `sessions` / `archived_sessions` 下的 rollout JSONL 是会话内容真相源
@@ -57,6 +61,7 @@ English README: [README.md](./README.md)
 - 后续 `--backfill-only`、默认模式和 `--follow-only` 都会优先走结构化增量发现
 - 如果你怀疑有漏发现，或者本地 Codex 数据目录发生了手动迁移，再用 `--rescan`
 - 最近一次运行到底走了全量还是增量，会写入 `_state/manifest.json` 和 `reports/archive-audit.md`
+- 最近一次 SQLite 状态库读取是否成功、schema 是否兼容，也会写入这些状态文件
 
 ## 会归档哪些内容
 
@@ -239,6 +244,12 @@ python watch_codex_sessions.py --repair-filenames
 python watch_codex_sessions.py --codex-home ~/.codex --output-dir output/codex-archive
 ```
 
+### 10. 指定自定义 SQLite 状态库路径
+
+```bash
+python watch_codex_sessions.py --state-db-path ~/.codex/state_5.sqlite --backfill-only
+```
+
 ## `--auto-git` 自动提交与推送
 
 脚本支持可选的归档自动同步：
@@ -293,6 +304,46 @@ codex-archive: sync 2026-03-28T10:00:00Z
 - 已记录的 `plan_hash` 是否仍能在原始 rollout JSONL 中重新定位
 - 是否发生了“计划已经导出，但原始来源里找不到”的保留缺失
 
+## Troubleshooting
+
+如果 SQLite 驱动的线程元数据缺失或质量下降，优先检查这些状态字段：
+
+- `state_db_path`
+  - 当前 watcher 实际使用的 SQLite 文件路径
+- `last_state_db_status`
+  - 最近一次状态库读取结果
+  - 常见值包括 `ok`、`missing`、`schema_error`、`error`
+- `last_state_db_schema_ok`
+  - `threads` 表结构是否符合当前脚本预期
+- `last_state_db_checked_at`
+  - 最近一次检查状态库的时间
+- `last_state_db_error`
+  - 最近一次连接、查询或 schema 检查的错误信息
+
+优先查看的位置：
+
+- `output/codex-archive/_state/manifest.json`
+- `output/codex-archive/reports/archive-audit.md`
+
+常见情况：
+
+- `last_state_db_status = missing`
+  - 当前配置的 SQLite 文件不存在
+  - 检查 `CODEX_HOME`，或显式传 `--state-db-path`
+- `last_state_db_status = schema_error`
+  - `threads` 表不存在，或者列结构发生变化
+  - 此时 rollout 解析仍可继续，但线程元数据可能不完整
+- `last_state_db_status = error`
+  - SQLite 无法连接或查询
+  - 常见原因包括锁冲突、损坏或 schema 不兼容
+
+建议恢复步骤：
+
+1. 先确认 `state_db_path` 指向的是否是正确文件
+2. 如果本机实际状态库不在默认位置，改用 `--state-db-path`
+3. 修正路径后执行一次 `--rescan --backfill-only`
+4. 再查看 `archive-audit.md`，确认状态是否恢复为 `ok`
+
 ## 输出内容的边界说明
 
 这个脚本面向“本地已落盘的 Codex 会话数据”。它不能保证得到所有运行时上下文，特别是：
@@ -300,6 +351,7 @@ codex-archive: sync 2026-03-28T10:00:00Z
 - 隐藏思考原文通常不可读
 - 某些 UI 层状态不一定出现在本地结构化文件里
 - 自动背景压缩是否发生，不作为判断计划是否丢失的依据
+- Codex 的本地存储结构未来可能变化；当前脚本对缺失或不兼容的 SQLite 状态库会做降级处理，但一旦上游 schema 变化，线程元数据质量可能下降，直到脚本更新
 
 对于计划保留问题，脚本采用的唯一真相源是 rollout JSONL。
 

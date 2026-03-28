@@ -39,6 +39,10 @@ The script reads these local Codex files:
 - `~/.codex/archived_sessions/**/*.jsonl`
 - `~/.codex/state_5.sqlite`
 
+The SQLite state database path is configurable with:
+
+- `--state-db-path /path/to/state.sqlite`
+
 How they are used:
 
 - rollout JSONL files are the source of truth for session content
@@ -68,6 +72,13 @@ The latest discovery mode and counters are recorded in:
 
 - `output/codex-archive/_state/manifest.json`
 - `output/codex-archive/reports/archive-audit.md`
+
+The latest SQLite state-db health is also recorded there, including:
+
+- db path
+- last read status
+- schema compatibility status
+- last read error, if any
 
 ## What Gets Archived
 
@@ -223,6 +234,12 @@ Use a custom Codex home and output directory:
 python watch_codex_sessions.py --codex-home ~/.codex --output-dir output/codex-archive
 ```
 
+Use a custom SQLite state database path:
+
+```bash
+python watch_codex_sessions.py --state-db-path ~/.codex/state_5.sqlite --backfill-only
+```
+
 ## Optional Auto Git Sync
 
 The watcher can optionally commit and push archive output:
@@ -258,12 +275,53 @@ Safety rules:
 - `reports/retention-audit.md`
   - whether extracted plan hashes can still be found in source rollout files
 
+## Troubleshooting
+
+If SQLite-backed thread metadata is missing or degraded, check these manifest and audit fields first:
+
+- `state_db_path`
+  - which SQLite file the watcher is using
+- `last_state_db_status`
+  - latest state-db read result
+  - expected values include `ok`, `missing`, `schema_error`, and `error`
+- `last_state_db_schema_ok`
+  - whether the `threads` table shape matches what the watcher expects
+- `last_state_db_checked_at`
+  - when the state database was last checked
+- `last_state_db_error`
+  - the latest connect, query, or schema error message
+
+Where to look:
+
+- `output/codex-archive/_state/manifest.json`
+- `output/codex-archive/reports/archive-audit.md`
+
+Common cases:
+
+- `last_state_db_status = missing`
+  - the configured SQLite file does not exist
+  - verify `CODEX_HOME` or pass `--state-db-path`
+- `last_state_db_status = schema_error`
+  - the `threads` table is missing or its columns changed
+  - rollout parsing still works, but thread metadata may be incomplete
+- `last_state_db_status = error`
+  - SQLite could not be opened or queried
+  - possible causes include locking, corruption, or incompatible schema
+
+Recommended recovery steps:
+
+1. Confirm the active SQLite path in `state_db_path`
+2. Retry with `--state-db-path` if Codex stores state elsewhere on your machine
+3. Run `--rescan --backfill-only` after fixing the path to rebuild source discovery
+4. Check `archive-audit.md` to confirm the watcher returned to `ok`
+
 ## Limits
 
 - hidden reasoning text is generally not accessible
 - some UI-only state may not exist in local persisted files
 - background compression state is not used as a source of truth
 - plan retention verification relies on rollout JSONL, not UI summaries
+- upstream Codex storage layout may change over time; the watcher degrades gracefully for missing or incompatible SQLite state, but schema changes may reduce thread metadata quality until the tool is updated
 
 ## Documentation Set
 
