@@ -300,6 +300,7 @@ class CodexArchiveWatcher:
         git_remote: str = "origin",
         git_commit_interval_seconds: int = 300,
         state_db_path: Optional[Path] = None,
+        verbose: bool = False,
     ) -> None:
         self.codex_home = codex_home
         self.output_dir = output_dir
@@ -310,6 +311,7 @@ class CodexArchiveWatcher:
         self.auto_git = auto_git
         self.git_remote = git_remote
         self.git_commit_interval_seconds = git_commit_interval_seconds
+        self.verbose = verbose
 
         self.state_dir = output_dir / "_state"
         self.sessions_dir = output_dir / "sessions"
@@ -338,6 +340,11 @@ class CodexArchiveWatcher:
         self.manifest = self._load_manifest()
         self.plan_manifest = self._load_plan_manifest()
         self._migrate_legacy_manifest_if_needed()
+
+    def log(self, message: str) -> None:
+        if not self.verbose:
+            return
+        print(f"[{utc_now()}] {message}", flush=True)
 
     def _load_manifest(self) -> Dict[str, Any]:
         manifest = load_json(
@@ -759,7 +766,14 @@ class CodexArchiveWatcher:
         self.write_thread_index(thread_registry)
         self.save_manifest()
         self.save_plan_manifest()
-        self.maybe_sync_git()
+        git_status = self.maybe_sync_git()
+        self.log(
+            "Processed "
+            f"{processed} source(s); discovery={self.manifest.get('last_discovery_mode') or 'unknown'}; "
+            f"new_sources={self.manifest.get('last_new_source_count', 0)}; "
+            f"state_db={self.manifest.get('last_state_db_status') or 'unknown'}; "
+            f"auto_git={git_status}"
+        )
         return processed
 
     def process_source(self, source: RolloutSource, thread_info: Optional[ThreadInfo]) -> None:
@@ -1424,9 +1438,9 @@ class CodexArchiveWatcher:
                     hashes.add(self.compute_plan_hash(session_id, current_turn_id, plan_body))
         return hashes
 
-    def maybe_sync_git(self) -> bool:
+    def maybe_sync_git(self) -> str:
         if not self.auto_git:
-            return False
+            return "disabled"
 
         last_sync = self.manifest.get("last_git_sync_at")
         if isinstance(last_sync, str):
@@ -1435,7 +1449,8 @@ class CodexArchiveWatcher:
             except ValueError:
                 last_epoch = 0.0
             if time.time() - last_epoch < self.git_commit_interval_seconds:
-                return False
+                self.log("Auto git sync skipped because commit interval has not elapsed yet")
+                return "cooldown"
 
         repo_root = Path(
             run_git_command(self.output_dir, ["git", "rev-parse", "--show-toplevel"]).stdout.strip()
@@ -1448,21 +1463,24 @@ class CodexArchiveWatcher:
 
         archive_status = run_git_command(repo_root, ["git", "status", "--porcelain", "--", output_rel]).stdout.strip()
         if not archive_status:
-            return False
+            self.log("Auto git sync skipped because no archive changes were detected")
+            return "no-changes"
 
         run_git_command(repo_root, ["git", "add", "-A", "--", output_rel])
         staged = [line.strip() for line in run_git_command(repo_root, ["git", "diff", "--cached", "--name-only"]).stdout.splitlines() if line.strip()]
         if any(not path.startswith(output_rel + "/") and path != output_rel for path in staged):
             raise RuntimeError("refusing auto git sync because staged set escaped output/codex-archive")
         if not staged:
-            return False
+            self.log("Auto git sync skipped because nothing under the archive path was staged")
+            return "no-changes"
 
         commit_message = f"codex-archive: sync {utc_now()}"
         run_git_command(repo_root, ["git", "commit", "-m", commit_message])
         run_git_command(repo_root, ["git", "push", self.git_remote, "HEAD"])
         self.manifest["last_git_sync_at"] = utc_now()
         self.save_manifest()
-        return True
+        self.log(f"Auto git sync committed and pushed archive changes to {self.git_remote}")
+        return "committed"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1484,6 +1502,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audit-filenames", action="store_true", help="Audit archive file names for invalid characters")
     parser.add_argument("--repair-filenames", action="store_true", help="Repair invalid dynamic file names under the archive path")
     parser.add_argument("--rescan", action="store_true", help="Force a full rollout source rescan before processing")
+    parser.add_argument("--verbose", action="store_true", help="Print runtime progress to stdout")
     return parser
 
 
@@ -1518,6 +1537,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         git_remote=args.git_remote,
         git_commit_interval_seconds=args.git_commit_interval_seconds,
         state_db_path=args.state_db_path,
+        verbose=args.verbose,
+    )
+
+    watcher.log(
+        f"Starting codex archive watcher with codex_home={watcher.codex_home}, output_dir={watcher.output_dir}, "
+        f"poll_seconds={watcher.poll_seconds}"
     )
 
     if args.verify_retention:
@@ -1530,6 +1555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return watcher.repair_filenames()
 
     if args.follow_only:
+        watcher.log("Follow-only mode: seeding existing sessions without re-exporting old content")
         watcher.seed_follow_only(
             watcher.discover_rollout_sources(
                 watcher.load_thread_registry(force_refresh=args.rescan),
@@ -1539,22 +1565,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         watcher.write_thread_index(watcher.load_thread_registry())
         watcher.save_manifest()
         watcher.save_plan_manifest()
+        watcher.log("Entering watch loop. Press Ctrl+C to stop.")
         try:
             while True:
                 watcher.process_all_sources(full_scan=False)
                 time.sleep(args.poll_seconds)
         except KeyboardInterrupt:
+            watcher.log("Stopped by user")
             return 0
 
     watcher.process_all_sources(full_scan=True if args.rescan else None)
     if args.backfill_only:
+        watcher.log("Backfill-only mode completed")
         return 0
 
+    watcher.log("Initial pass completed. Entering watch loop. Press Ctrl+C to stop.")
     try:
         while True:
             watcher.process_all_sources(full_scan=False)
             time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
+        watcher.log("Stopped by user")
         return 0
 
 

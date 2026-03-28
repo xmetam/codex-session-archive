@@ -208,43 +208,49 @@ python watch_codex_sessions.py --follow-only
 python watch_codex_sessions.py
 ```
 
-### 4. 强制重新全量发现 rollout 源
+### 4. 打印可见运行日志
+
+```bash
+python watch_codex_sessions.py --verbose
+```
+
+### 5. 强制重新全量发现 rollout 源
 
 ```bash
 python watch_codex_sessions.py --rescan --backfill-only
 ```
 
-### 5. 校验已提取计划是否仍能从原始 rollout 中找到
+### 6. 校验已提取计划是否仍能从原始 rollout 中找到
 
 ```bash
 python watch_codex_sessions.py --verify-retention
 ```
 
-### 6. 审计历史会话是否都已归档完成
+### 7. 审计历史会话是否都已归档完成
 
 ```bash
 python watch_codex_sessions.py --audit-archive
 ```
 
-### 7. 审计归档文件名是否规范
+### 8. 审计归档文件名是否规范
 
 ```bash
 python watch_codex_sessions.py --audit-filenames
 ```
 
-### 8. 修复不规范的动态文件名
+### 9. 修复不规范的动态文件名
 
 ```bash
 python watch_codex_sessions.py --repair-filenames
 ```
 
-### 9. 指定 Codex 数据目录和输出目录
+### 10. 指定 Codex 数据目录和输出目录
 
 ```bash
 python watch_codex_sessions.py --codex-home ~/.codex --output-dir output/codex-archive
 ```
 
-### 10. 指定自定义 SQLite 状态库路径
+### 11. 指定自定义 SQLite 状态库路径
 
 ```bash
 python watch_codex_sessions.py --state-db-path ~/.codex/state_5.sqlite --backfill-only
@@ -276,6 +282,27 @@ python watch_codex_sessions.py --follow-only --auto-git
 codex-archive: sync 2026-03-28T10:00:00Z
 ```
 
+## `--verbose` 运行可见性
+
+脚本默认是安静运行的。这对长期 `--follow-only` 监听很有帮助，但在交互式终端里容易让人误以为“没有反应”。
+
+如果你希望看到实时进度，建议显式加上 `--verbose`：
+
+```bash
+python watch_codex_sessions.py --backfill-only --verbose
+python watch_codex_sessions.py --follow-only --verbose
+python watch_codex_sessions.py --follow-only --auto-git --verbose
+```
+
+启用后会打印：
+
+- 启动时使用的 `codex_home`、`output_dir`、`poll_seconds`
+- 本轮发现是 `full` 还是 `incremental`
+- 本轮处理了多少 source
+- 当前 `state_db` 状态
+- auto-git 是 `disabled`、`no-changes`、`cooldown` 还是 `committed`
+- 何时进入 watch 循环
+
 ## 审计报告说明
 
 ### `reports/archive-audit.md`
@@ -305,6 +332,23 @@ codex-archive: sync 2026-03-28T10:00:00Z
 - 是否发生了“计划已经导出，但原始来源里找不到”的保留缺失
 
 ## Troubleshooting
+
+### 执行后看起来没有任何反应
+
+如果你直接运行默认模式，例如：
+
+```bash
+python watch_codex_sessions.py --output-dir output/codex-archive --auto-git
+```
+
+脚本会先处理一轮，然后进入持续 watch 循环。默认不打印日志，所以看起来可能像“没有反应”，但进程其实是正常挂起等待新变化。
+
+建议这样排查：
+
+1. 用 `python watch_codex_sessions.py --backfill-only --verbose` 看一次性的可见执行
+2. 用 `python watch_codex_sessions.py --follow-only --verbose` 看持续监听时的实时状态
+3. 查看 `output/codex-archive/_state/manifest.json`
+4. 查看 `output/codex-archive/reports/archive-audit.md`
 
 如果 SQLite 驱动的线程元数据缺失或质量下降，优先检查这些状态字段：
 

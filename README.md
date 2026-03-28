@@ -198,6 +198,12 @@ Backfill once, then continue following:
 python watch_codex_sessions.py
 ```
 
+Run with visible runtime progress:
+
+```bash
+python watch_codex_sessions.py --verbose
+```
+
 Force a full source rediscovery:
 
 ```bash
@@ -260,6 +266,27 @@ Safety rules:
 - if staged changes already exist outside the archive path, auto-sync is refused
 - if there is no archive delta, nothing is committed or pushed
 
+## Runtime Visibility
+
+By default the watcher is quiet. This keeps long-running watch mode usable in the background, but it can make an interactive run look idle.
+
+Use `--verbose` when you want visible runtime progress:
+
+```bash
+python watch_codex_sessions.py --backfill-only --verbose
+python watch_codex_sessions.py --follow-only --verbose
+python watch_codex_sessions.py --follow-only --auto-git --verbose
+```
+
+With `--verbose`, the watcher prints:
+
+- startup configuration
+- whether discovery was `full` or `incremental`
+- how many sources were processed
+- current `state_db` health summary
+- whether auto git was `disabled`, `no-changes`, `cooldown`, or `committed`
+- when the process enters the watch loop
+
 ## Audit Reports
 
 - `reports/archive-audit.md`
@@ -276,6 +303,17 @@ Safety rules:
   - whether extracted plan hashes can still be found in source rollout files
 
 ## Troubleshooting
+
+### The command seems to do nothing
+
+If you run the default watch mode without `--backfill-only` or `--follow-only`, the watcher performs one pass and then stays in the watch loop. Without `--verbose`, this can look like "no reaction" even though the process is healthy.
+
+Recommended checks:
+
+1. Run `python watch_codex_sessions.py --backfill-only --verbose` for a one-shot visible pass
+2. Run `python watch_codex_sessions.py --follow-only --verbose` for an interactive watch session
+3. Inspect `output/codex-archive/_state/manifest.json` for the latest discovery and state-db fields
+4. Inspect `output/codex-archive/reports/archive-audit.md` for a summarized health snapshot
 
 If SQLite-backed thread metadata is missing or degraded, check these manifest and audit fields first:
 
