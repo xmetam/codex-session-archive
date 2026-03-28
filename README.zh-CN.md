@@ -1,0 +1,324 @@
+# `watch_codex_sessions.py`
+
+English README: [README.md](./README.md)
+
+下面的命令示例默认假设这个工具目录本身就是仓库根目录。如果你把它嵌在别的仓库里使用，请把命令里的脚本路径改成你的实际路径。
+
+`watch_codex_sessions.py` 用于把本机 Codex Desktop 的会话数据归档到本地可控目录中的 `output/codex-archive/`，同时提取 Plan 模式中的 `<proposed_plan>...</proposed_plan>` 为独立 Markdown 文档。
+
+这个脚本的设计目标是：
+
+- 回填历史会话
+- 持续跟踪新增会话
+- 默认使用增量发现与增量读取，避免反复全量扫描 rollout 目录
+- 同时归档主线程和 subagent 线程
+- 保留可见会话、工具调用、工具结果和调度事件
+- 对执行计划做独立落盘、审计和保留校验
+- 把归档输出限制在 `output/codex-archive/`，避免和源码或其他工作文件混在一起
+
+## 适用范围
+
+- 平台：Windows、Linux、macOS
+- 实现：Python 标准库
+- 默认 Codex 数据目录：
+  - 优先读取环境变量 `CODEX_HOME`
+  - 未设置时回退到 `~/.codex`
+
+## 读取的数据源
+
+脚本会组合读取以下本地文件：
+
+- `~/.codex/session_index.jsonl`
+- `~/.codex/sessions/**/*.jsonl`
+- `~/.codex/archived_sessions/**/*.jsonl`
+- `~/.codex/state_5.sqlite`
+
+用途分工：
+
+- `sessions` / `archived_sessions` 下的 rollout JSONL 是会话内容真相源
+- `session_index.jsonl` 用于发现新的线程名称和新增线程
+- `state_5.sqlite` 的 `threads` 表用于补齐线程标题、subagent 元信息和父子关系
+
+## 增量机制
+
+脚本现在分两层做增量：
+
+- 读取层增量
+  - 每个 session 都会保存 `last_offset`
+  - 再次处理同一个 rollout 时，只从上次偏移继续读取新增内容
+- 发现层增量
+  - 首次运行或显式 `--rescan` 时，才递归扫描 `sessions/` 和 `archived_sessions/`
+  - 常规运行时，优先依赖 `session_index.jsonl` 的新增尾部和 `state_5.sqlite` 的线程元数据发现新会话
+  - 已知 rollout 路径会写入 `_state/manifest.json`，后续直接复用
+
+这意味着：
+
+- 第一次建档时会做一次全量发现
+- 后续 `--backfill-only`、默认模式和 `--follow-only` 都会优先走结构化增量发现
+- 如果你怀疑有漏发现，或者本地 Codex 数据目录发生了手动迁移，再用 `--rescan`
+- 最近一次运行到底走了全量还是增量，会写入 `_state/manifest.json` 和 `reports/archive-audit.md`
+
+## 会归档哪些内容
+
+会归档这些可见信息：
+
+- 用户消息
+- assistant 最终回复
+- assistant commentary
+- 工具调用
+- 工具输出
+- 调度事件
+  - `spawn_agent`
+  - `send_input`
+  - `wait_agent`
+  - `close_agent`
+- reasoning 事件元数据
+
+不会导出隐藏思考原文。`reasoning` 只记录事件存在性和是否含有加密载荷，不尝试解密或伪造 CoT。
+
+## Plan 提取规则
+
+脚本会从 assistant 消息中提取：
+
+```text
+<proposed_plan>
+...
+</proposed_plan>
+```
+
+提取规则：
+
+- 优先要求当前 turn 处于 `collaboration_mode_kind == "plan"`
+- 如果历史数据里能看到 `<proposed_plan>`，但无法确认 mode，仍会提取
+- 计划标题优先取 plan 块内第一个 Markdown `# Heading`
+- 如果没有 `# Heading`，则取第一行非空文本
+- 文件名会自动清洗，移除如 `#`、反引号、Windows 非法字符等不规范内容
+- 重名文件会自动追加 `-2`、`-3`
+
+计划文件 front matter 会记录：
+
+- `title`
+- `session_id`
+- `thread_name`
+- `source_kind`
+- `parent_thread_id`
+- `agent_nickname`
+- `agent_role`
+- `source_turn_id`
+- `plan_mode_confirmed`
+- `plan_generated_at`
+- `extracted_at`
+- `source_rollout`
+
+关于时间：
+
+- `plan_generated_at` 取自生成该计划的会话事件时间
+- Windows 上会尽力把计划文件的文件系统创建时间同步为 `plan_generated_at`
+- Linux / macOS 不保证能修改 birth time，因此应以 front matter 中的 `plan_generated_at` 为准
+
+## 输出目录结构
+
+默认输出目录：
+
+- `output/codex-archive/`
+
+主要结构如下：
+
+```text
+output/codex-archive/
+  thread_index.json
+  _state/
+    manifest.json
+    plans.json
+    sessions/<session-id>.json
+  reports/
+    archive-audit.md
+    filename-audit.md
+    retention-audit.md
+  sessions/
+    <session-id>/
+      meta.json
+      events/
+        part-0001.jsonl
+        part-0002.jsonl
+      transcript/
+        part-0001.md
+        part-0002.md
+  plans/
+    <sanitized-title>.md
+    <sanitized-title>.part-0002.md
+```
+
+其中：
+
+- `meta.json` 保存线程级元数据
+- `events/part-*.jsonl` 保存规范化后的事件流
+- `transcript/part-*.md` 保存适合阅读的转录
+- `thread_index.json` 保存主线程与 subagent 的父子关系
+- `_state/` 保存增量跟踪和 plan 索引状态
+- `reports/` 保存审计报告
+
+`_state/manifest.json` 里还会记录最近一次运行的发现状态，例如：
+
+- `last_discovery_mode`
+- `last_full_scan_at`
+- `last_incremental_scan_at`
+- `last_discovered_source_count`
+- `last_new_source_count`
+- `last_processed_source_count`
+
+## 大文件自动拆分
+
+为避免归档文件持续变大，脚本会自动分片：
+
+- `events` 默认每片最大 `32 MiB`
+- `transcript` 默认每片最大 `16 MiB`
+- `plan` 默认每片最大 `8 MiB`
+
+对应参数：
+
+```bash
+python watch_codex_sessions.py --events-max-bytes 33554432 --transcript-max-bytes 16777216 --plan-max-bytes 8388608
+```
+
+如果检测到旧格式的单文件归档，脚本会在后续运行中自动迁移为分片格式。
+
+## 常用命令
+
+### 1. 回填全部历史会话
+
+```bash
+python watch_codex_sessions.py --backfill-only
+```
+
+### 2. 持续跟踪新会话
+
+```bash
+python watch_codex_sessions.py --follow-only
+```
+
+### 3. 先回填，再持续跟踪
+
+```bash
+python watch_codex_sessions.py
+```
+
+### 4. 强制重新全量发现 rollout 源
+
+```bash
+python watch_codex_sessions.py --rescan --backfill-only
+```
+
+### 5. 校验已提取计划是否仍能从原始 rollout 中找到
+
+```bash
+python watch_codex_sessions.py --verify-retention
+```
+
+### 6. 审计历史会话是否都已归档完成
+
+```bash
+python watch_codex_sessions.py --audit-archive
+```
+
+### 7. 审计归档文件名是否规范
+
+```bash
+python watch_codex_sessions.py --audit-filenames
+```
+
+### 8. 修复不规范的动态文件名
+
+```bash
+python watch_codex_sessions.py --repair-filenames
+```
+
+### 9. 指定 Codex 数据目录和输出目录
+
+```bash
+python watch_codex_sessions.py --codex-home ~/.codex --output-dir output/codex-archive
+```
+
+## `--auto-git` 自动提交与推送
+
+脚本支持可选的归档自动同步：
+
+```bash
+python watch_codex_sessions.py --follow-only --auto-git
+```
+
+相关参数：
+
+- `--auto-git`
+- `--git-remote origin`
+- `--git-commit-interval-seconds 300`
+
+安全边界：
+
+- 只会处理 `output/codex-archive/`
+- 如果暂存区里已经有该路径以外的 staged 变更，脚本会拒绝自动同步
+- 如果本轮没有归档变化，不会 commit 或 push
+
+默认 commit message 形如：
+
+```text
+codex-archive: sync 2026-03-28T10:00:00Z
+```
+
+## 审计报告说明
+
+### `reports/archive-audit.md`
+
+用于检查：
+
+- 最近一次归档运行走的是全量发现还是增量发现
+- 最近一次发现到了多少 rollout 源、其中多少是新增源
+- 历史 active sessions 是否都已导出
+- 历史 archived sessions 是否都已导出
+- session state 的 `last_offset` 是否已经追平源 rollout 文件大小
+- 是否存在孤儿归档
+- `thread_index.json` 中主线程与 subagent 的父子关系是否完整
+
+### `reports/filename-audit.md`
+
+用于检查：
+
+- 计划文件名是否包含不规范字符
+- 路径组件是否含有 `#`、反引号、Windows 非法字符、尾部句点或多余空格
+
+### `reports/retention-audit.md`
+
+用于检查：
+
+- 已记录的 `plan_hash` 是否仍能在原始 rollout JSONL 中重新定位
+- 是否发生了“计划已经导出，但原始来源里找不到”的保留缺失
+
+## 输出内容的边界说明
+
+这个脚本面向“本地已落盘的 Codex 会话数据”。它不能保证得到所有运行时上下文，特别是：
+
+- 隐藏思考原文通常不可读
+- 某些 UI 层状态不一定出现在本地结构化文件里
+- 自动背景压缩是否发生，不作为判断计划是否丢失的依据
+
+对于计划保留问题，脚本采用的唯一真相源是 rollout JSONL。
+
+## 相关文档
+
+- 英文 README: [README.md](./README.md)
+- 贡献指南: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- 发布清单: [PUBLISHING_CHECKLIST.md](./PUBLISHING_CHECKLIST.md)
+- 独立仓库忽略规则模板: [.gitignore.example](./.gitignore.example)
+- 脚本：[watch_codex_sessions.py](./watch_codex_sessions.py)
+- 测试：`tests/test_watch_codex_sessions.py`
+
+## 公开仓库安全提示
+
+这套代码和文档本身适合公开，但真实归档数据通常不适合直接公开。公开前请避免上传：
+
+- `output/codex-archive/`
+- 真实会话转录
+- 真实计划导出结果
+- 从 `~/.codex` 直接复制出来的原始状态数据
+
+如果你把这个目录拆成独立仓库，建议在首次公开推送前，把 [.gitignore.example](./.gitignore.example) 改名为 `.gitignore`。
