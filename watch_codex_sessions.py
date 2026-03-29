@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +25,8 @@ HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*#`]+')
 TRAILING_DOT_RE = re.compile(r"[. ]+$")
 SPACE_RE = re.compile(r"\s+")
+PLAN_PART_RE = re.compile(r"^(?P<prefix>.+)\.part-(?P<index>\d{4})(?P<suffix>\.md)$", re.IGNORECASE)
+PLAN_FRONT_MATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)
 
 MANIFEST_VERSION = 2
 ORCHESTRATION_TOOLS = {"spawn_agent", "send_input", "wait_agent", "close_agent"}
@@ -173,8 +177,42 @@ def extract_plan_title(plan_body: str) -> str:
 
 
 def write_json(path: Path, payload: Any) -> None:
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(path, content)
+
+
+def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    last_error: Optional[OSError] = None
+    for attempt in range(3):
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            os.replace(temp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if attempt == 2:
+                break
+            time.sleep(0.1 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -186,8 +224,96 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def scrub_payload(payload: Any, ignore_keys: Iterable[str] = ()) -> Any:
+    ignore = set(ignore_keys)
+    if isinstance(payload, dict):
+        return {key: scrub_payload(value, ignore) for key, value in payload.items() if key not in ignore}
+    if isinstance(payload, list):
+        return [scrub_payload(value, ignore) for value in payload]
+    return payload
+
+
+def write_json_if_changed(path: Path, payload: Any, ignore_keys: Iterable[str] = ()) -> bool:
+    existing = load_json(path, None)
+    if existing is not None and scrub_payload(existing, ignore_keys) == scrub_payload(payload, ignore_keys):
+        return False
+    write_json(path, payload)
+    return True
+
+
 def yaml_escape(value: Optional[str]) -> str:
     return json.dumps("" if value is None else value, ensure_ascii=False)
+
+
+def parse_front_matter_value(raw: str) -> Any:
+    text = raw.strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def split_plan_document(text: str) -> Tuple[Dict[str, Any], str]:
+    match = PLAN_FRONT_MATTER_RE.match(text)
+    if not match:
+        return {}, text
+    metadata: Dict[str, Any] = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        if not key:
+            continue
+        metadata[key] = parse_front_matter_value(raw_value)
+    return metadata, text[match.end() :]
+
+
+def normalize_plan_body(plan_body: str) -> str:
+    return plan_body.rstrip() + "\n"
+
+
+def plan_file_sort_key(path: Path) -> Tuple[str, int, int, str]:
+    stem = path.stem
+    match = re.match(r"^(?P<base>.+?)-(?P<suffix>\d+)$", stem)
+    if match:
+        return (match.group("base"), 1, int(match.group("suffix")), path.name.lower())
+    return (stem, 0, 0, path.name.lower())
+
+
+def preferred_plan_document_paths(paths: List[Path]) -> Optional[List[Tuple[Path, Path]]]:
+    if not paths:
+        return None
+
+    rename_pairs: List[Tuple[Path, Path]] = []
+    for path in paths:
+        part_match = PLAN_PART_RE.match(path.name)
+        if part_match:
+            prefix = part_match.group("prefix")
+            suffix = f".part-{part_match.group('index')}{part_match.group('suffix')}"
+        else:
+            prefix = path.stem
+            suffix = path.suffix
+
+        prefix_match = re.match(r"^(?P<base>.+?)-(?P<index>\d+)$", prefix)
+        if not prefix_match:
+            return None
+
+        target = path.with_name(f"{prefix_match.group('base')}{suffix}")
+        rename_pairs.append((path, target))
+
+    if all(source.resolve() == target.resolve() for source, target in rename_pairs):
+        return None
+    return rename_pairs
 
 
 def write_chunked_lines(directory: Path, lines: Iterable[str], max_bytes: int, suffix: str) -> List[Dict[str, Any]]:
@@ -219,16 +345,27 @@ def write_chunked_lines(directory: Path, lines: Iterable[str], max_bytes: int, s
     if not parts:
         parts = [[""]]
 
-    for old in directory.glob(f"part-*{suffix}"):
-        old.unlink()
-
+    expected_paths: set[Path] = set()
     metadata: List[Dict[str, Any]] = []
     for index, bucket in enumerate(parts, start=1):
         path = directory / f"part-{index:04d}{suffix}"
         content = "".join(bucket)
-        path.write_text(content, encoding="utf-8")
+        atomic_write_text(path, content)
+        expected_paths.add(path.resolve())
         metadata.append({"path": str(path), "size_bytes": path.stat().st_size})
+    for old in directory.glob(f"part-*{suffix}"):
+        if old.resolve() not in expected_paths:
+            old.unlink()
     return metadata
+
+
+def read_chunked_content(directory: Path, suffix: str) -> str:
+    if not directory.exists():
+        return ""
+    parts: List[str] = []
+    for path in sorted(directory.glob(f"part-*{suffix}")):
+        parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "".join(parts)
 
 
 def run_git_command(repo_root: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -340,6 +477,7 @@ class CodexArchiveWatcher:
         self.manifest = self._load_manifest()
         self.plan_manifest = self._load_plan_manifest()
         self._migrate_legacy_manifest_if_needed()
+        self.rebuild_plan_manifest_from_files(save_if_changed=True)
 
     def log(self, message: str) -> None:
         if not self.verbose:
@@ -425,14 +563,16 @@ class CodexArchiveWatcher:
             self.save_plan_manifest()
 
     def save_manifest(self) -> None:
-        self.manifest["generated_at"] = utc_now()
-        self.manifest["session_count"] = len(list(self.session_states_dir.glob("*.json")))
-        self.manifest["plan_count"] = len(self.plan_manifest)
-        self.manifest["state_db_path"] = str(self.state_db_path)
-        write_json(self.manifest_path, self.manifest)
+        payload = copy.deepcopy(self.manifest)
+        payload["generated_at"] = utc_now()
+        payload["session_count"] = len(list(self.session_states_dir.glob("*.json")))
+        payload["plan_count"] = len(self.plan_manifest)
+        payload["state_db_path"] = str(self.state_db_path)
+        if write_json_if_changed(self.manifest_path, payload, ignore_keys=("generated_at",)):
+            self.manifest = payload
 
     def save_plan_manifest(self) -> None:
-        write_json(self.plans_state_path, self.plan_manifest)
+        write_json_if_changed(self.plans_state_path, self.plan_manifest)
 
     def session_state_path(self, session_id: str) -> Path:
         return self.session_states_dir / f"{session_id}.json"
@@ -441,6 +581,7 @@ class CodexArchiveWatcher:
         state = load_json(self.session_state_path(session_id), {})
         if not isinstance(state, dict):
             state = {}
+        now = utc_now()
         state.setdefault("source_rollout", "")
         state.setdefault("origin", "")
         state.setdefault("archived", False)
@@ -448,12 +589,12 @@ class CodexArchiveWatcher:
         state.setdefault("current_turn_id", None)
         state.setdefault("current_turn_mode", None)
         state.setdefault("call_names", {})
-        state.setdefault("first_seen_at", utc_now())
-        state.setdefault("last_seen_at", utc_now())
+        state.setdefault("first_seen_at", now)
+        state.setdefault("last_seen_at", state.get("first_seen_at") or now)
         return state
 
     def write_session_state(self, session_id: str, state: Dict[str, Any]) -> None:
-        write_json(self.session_state_path(session_id), state)
+        write_json_if_changed(self.session_state_path(session_id), state)
 
     def note_state_db_status(self, status: str, error: str = "", schema_ok: Optional[bool] = None) -> None:
         self.manifest["last_state_db_status"] = status
@@ -582,12 +723,22 @@ class CodexArchiveWatcher:
         new_source_count: int,
     ) -> None:
         now = utc_now()
+        previous_mode = self.manifest.get("last_discovery_mode") or ""
+        previous_source_count = int(self.manifest.get("last_discovered_source_count", 0) or 0)
+        previous_new_source_count = int(self.manifest.get("last_new_source_count", 0) or 0)
+
         self.manifest["last_discovery_mode"] = mode
         self.manifest["last_discovered_source_count"] = source_count
         self.manifest["last_new_source_count"] = new_source_count
-        if mode == "full":
+
+        discovery_changed = (
+            mode != previous_mode
+            or source_count != previous_source_count
+            or new_source_count != previous_new_source_count
+        )
+        if mode == "full" and discovery_changed:
             self.manifest["last_full_scan_at"] = now
-        else:
+        elif mode == "incremental" and discovery_changed:
             self.manifest["last_incremental_scan_at"] = now
 
     def update_session_index_checkpoint(self) -> None:
@@ -702,24 +853,34 @@ class CodexArchiveWatcher:
         session_state["source_rollout"] = str(source.path)
         session_state["origin"] = source.origin
         session_state["archived"] = source.archived
-        session_state["last_seen_at"] = utc_now()
-        self.write_session_state(source.session_id, session_state)
         return session_state
 
     def seed_follow_only(self, sources: Dict[str, RolloutSource]) -> None:
         seeded = False
         for source in sources.values():
-            session_state = self._session_manifest(source)
+            session_state = self.load_session_state(source.session_id)
+            original_state = copy.deepcopy(session_state)
+            session_state["source_rollout"] = str(source.path)
+            session_state["origin"] = source.origin
+            session_state["archived"] = source.archived
             if session_state.get("last_offset"):
+                if session_state != original_state:
+                    session_state["last_seen_at"] = utc_now()
+                    self.write_session_state(source.session_id, session_state)
                 continue
             if self.session_events_parts_dir(source.session_id).exists():
+                if session_state != original_state:
+                    session_state["last_seen_at"] = utc_now()
+                    self.write_session_state(source.session_id, session_state)
                 continue
             try:
                 session_state["last_offset"] = source.path.stat().st_size
             except FileNotFoundError:
                 continue
-            self.write_session_state(source.session_id, session_state)
-            seeded = True
+            if session_state != original_state:
+                session_state["last_seen_at"] = utc_now()
+                self.write_session_state(source.session_id, session_state)
+                seeded = True
         if seeded:
             self.save_manifest()
 
@@ -778,6 +939,7 @@ class CodexArchiveWatcher:
 
     def process_source(self, source: RolloutSource, thread_info: Optional[ThreadInfo]) -> None:
         session_state = self._session_manifest(source)
+        original_session_state = copy.deepcopy(session_state)
         try:
             file_size = source.path.stat().st_size
         except FileNotFoundError:
@@ -812,11 +974,13 @@ class CodexArchiveWatcher:
                 normalized_events.extend(self.normalize_row(row, source, thread_info, session_state))
                 session_state["last_offset"] = new_offset
 
-        self.write_session_state(source.session_id, session_state)
+        session_state_changed = session_state != original_session_state
+        if session_state_changed:
+            session_state["last_seen_at"] = utc_now()
+            self.write_session_state(source.session_id, session_state)
         if normalized_events:
             self.append_normalized_events(source.session_id, normalized_events)
         resolved_thread = thread_info or self.fallback_thread_info(source.session_id, source)
-        self.write_meta(source, resolved_thread)
         self.render_transcript(source.session_id, resolved_thread)
         self.write_meta(source, resolved_thread)
 
@@ -1009,7 +1173,7 @@ class CodexArchiveWatcher:
             "events_parts": self.collect_part_metadata(self.session_events_parts_dir(source.session_id), ".jsonl"),
             "transcript_parts": self.collect_part_metadata(self.session_transcript_parts_dir(source.session_id), ".md"),
         }
-        write_json(self.session_meta_path(source.session_id), payload)
+        write_json_if_changed(self.session_meta_path(source.session_id), payload)
 
     def migrate_legacy_transcript_if_needed(self, session_id: str) -> None:
         parts_dir = self.session_transcript_parts_dir(session_id)
@@ -1075,7 +1239,11 @@ class CodexArchiveWatcher:
                 lines.append("Detected a reasoning event. Hidden raw reasoning is not exported.\n")
             lines.append("\n")
         self.migrate_legacy_transcript_if_needed(session_id)
-        write_chunked_lines(self.session_transcript_parts_dir(session_id), lines, self.transcript_max_bytes, ".md")
+        transcript_dir = self.session_transcript_parts_dir(session_id)
+        content = "".join(lines)
+        if read_chunked_content(transcript_dir, ".md") == content:
+            return
+        write_chunked_lines(transcript_dir, lines, self.transcript_max_bytes, ".md")
 
     def extract_plan_bodies(self, text: str) -> List[str]:
         return [match.group(1).strip() for match in PLAN_BLOCK_RE.finditer(text)]
@@ -1086,8 +1254,158 @@ class CodexArchiveWatcher:
         digest.update(b"\n")
         digest.update((source_turn_id or "").encode("utf-8"))
         digest.update(b"\n")
-        digest.update(plan_body.encode("utf-8"))
+        digest.update(normalize_plan_body(plan_body).encode("utf-8"))
         return digest.hexdigest()
+
+    def compute_plan_content_hash(self, plan_body: str) -> str:
+        digest = hashlib.sha256()
+        digest.update(normalize_plan_body(plan_body).encode("utf-8"))
+        return digest.hexdigest()
+
+    def build_plan_source_record(
+        self,
+        source: RolloutSource,
+        thread_info: ThreadInfo,
+        source_turn_id: Optional[str],
+        plan_mode_confirmed: bool,
+        plan_generated_at: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "session_id": source.session_id,
+            "thread_name": thread_info.thread_name,
+            "source_kind": thread_info.source_kind,
+            "parent_thread_id": thread_info.parent_thread_id,
+            "agent_nickname": thread_info.agent_nickname,
+            "agent_role": thread_info.agent_role,
+            "source_turn_id": source_turn_id,
+            "plan_mode_confirmed": plan_mode_confirmed,
+            "plan_generated_at": plan_generated_at or utc_now(),
+            "source_rollout": str(source.path),
+        }
+
+    def merge_plan_sources(self, sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            key = (
+                source.get("session_id"),
+                source.get("source_turn_id"),
+                source.get("source_rollout"),
+                source.get("thread_name"),
+                source.get("agent_nickname"),
+            )
+            if key not in merged:
+                merged[key] = copy.deepcopy(source)
+        return sorted(
+            merged.values(),
+            key=lambda item: (
+                str(item.get("plan_generated_at") or ""),
+                str(item.get("session_id") or ""),
+                str(item.get("source_turn_id") or ""),
+                str(item.get("source_rollout") or ""),
+            ),
+        )
+
+    def plan_documents(self) -> List[List[Path]]:
+        documents: List[List[Path]] = []
+        for path in sorted(self.plans_dir.glob("*.md")):
+            match = PLAN_PART_RE.match(path.name)
+            if match:
+                if match.group("index") != "0001":
+                    continue
+                prefix = match.group("prefix")
+                suffix = match.group("suffix")
+                parts = sorted(path.parent.glob(f"{prefix}.part-*{suffix}"))
+                documents.append(parts)
+                continue
+            documents.append([path])
+        return documents
+
+    def read_plan_document(self, paths: List[Path]) -> Tuple[Dict[str, Any], str]:
+        text = "".join(path.read_text(encoding="utf-8", errors="replace") for path in paths)
+        return split_plan_document(text)
+
+    def plan_priority_key(self, meta: Dict[str, Any]) -> Tuple[str, int, str]:
+        source_kind = str(meta.get("source_kind") or "")
+        path_value = str(meta.get("path") or "")
+        return (
+            str(meta.get("plan_generated_at") or meta.get("extracted_at") or ""),
+            0 if source_kind == "main" else 1,
+            "|".join(str(part) for part in plan_file_sort_key(Path(path_value))) if path_value else "",
+        )
+
+    def find_plan_by_content_hash(self, content_hash: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        matches = [
+            (plan_hash, meta)
+            for plan_hash, meta in self.plan_manifest.items()
+            if isinstance(meta, dict) and meta.get("content_hash") == content_hash
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: self.plan_priority_key(item[1]))
+        return matches[0]
+
+    def rebuild_plan_manifest_from_files(self, save_if_changed: bool = False) -> bool:
+        rebuilt: Dict[str, Dict[str, Any]] = {}
+        changed = False
+        for paths in self.plan_documents():
+            front_matter, plan_body = self.read_plan_document(paths)
+            normalized_body = normalize_plan_body(plan_body)
+            session_id = str(front_matter.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            source_turn_id = front_matter.get("source_turn_id")
+            if source_turn_id is not None:
+                source_turn_id = str(source_turn_id)
+            plan_hash = self.compute_plan_hash(session_id, source_turn_id, normalized_body)
+            content_hash = self.compute_plan_content_hash(normalized_body)
+            source_record = self.build_plan_source_record(
+                RolloutSource(
+                    session_id=session_id,
+                    path=Path(str(front_matter.get("source_rollout") or "")) if front_matter.get("source_rollout") else Path(),
+                    origin="",
+                    archived=False,
+                ),
+                ThreadInfo(
+                    session_id=session_id,
+                    thread_name=str(front_matter.get("thread_name") or session_id),
+                    thread_title="",
+                    source_kind=str(front_matter.get("source_kind") or "main"),
+                    parent_thread_id=str(front_matter.get("parent_thread_id")) if front_matter.get("parent_thread_id") else None,
+                    agent_nickname=str(front_matter.get("agent_nickname")) if front_matter.get("agent_nickname") else None,
+                    agent_role=str(front_matter.get("agent_role")) if front_matter.get("agent_role") else None,
+                    depth=0,
+                    rollout_path=str(front_matter.get("source_rollout") or ""),
+                    archived=False,
+                ),
+                source_turn_id,
+                bool(front_matter.get("plan_mode_confirmed")),
+                str(front_matter.get("plan_generated_at") or front_matter.get("extracted_at") or ""),
+            )
+            rebuilt[plan_hash] = {
+                "path": str(paths[0]),
+                "paths": [str(path) for path in paths],
+                "session_id": session_id,
+                "thread_name": str(front_matter.get("thread_name") or session_id),
+                "source_kind": str(front_matter.get("source_kind") or "main"),
+                "parent_thread_id": str(front_matter.get("parent_thread_id")) if front_matter.get("parent_thread_id") else None,
+                "agent_nickname": str(front_matter.get("agent_nickname")) if front_matter.get("agent_nickname") else None,
+                "agent_role": str(front_matter.get("agent_role")) if front_matter.get("agent_role") else None,
+                "source_turn_id": source_turn_id,
+                "plan_mode_confirmed": bool(front_matter.get("plan_mode_confirmed")),
+                "plan_generated_at": str(front_matter.get("plan_generated_at") or front_matter.get("extracted_at") or ""),
+                "source_rollout": str(front_matter.get("source_rollout") or ""),
+                "title": str(front_matter.get("title") or extract_plan_title(normalized_body)),
+                "content_hash": content_hash,
+                "sources": [source_record],
+            }
+        if rebuilt and rebuilt != self.plan_manifest:
+            self.plan_manifest = rebuilt
+            changed = True
+        if changed and save_if_changed:
+            self.save_plan_manifest()
+        return changed
 
     def allocate_plan_base_path(self, title: str) -> Path:
         base_name = normalize_filename(title)
@@ -1109,7 +1427,7 @@ class CodexArchiveWatcher:
             old.unlink()
         lines = content.splitlines(keepends=True)
         if len(content.encode("utf-8")) <= self.plan_max_bytes:
-            base_path.write_text(content, encoding="utf-8")
+            atomic_write_text(base_path, content)
             return [str(base_path)]
 
         if base_path.exists():
@@ -1134,8 +1452,42 @@ class CodexArchiveWatcher:
         plan_generated_at: Optional[str],
         plan_body: str,
     ) -> None:
-        plan_hash = self.compute_plan_hash(source.session_id, source_turn_id, plan_body)
+        normalized_body = normalize_plan_body(plan_body)
+        plan_hash = self.compute_plan_hash(source.session_id, source_turn_id, normalized_body)
         if plan_hash in self.plan_manifest:
+            return
+        content_hash = self.compute_plan_content_hash(normalized_body)
+        source_record = self.build_plan_source_record(
+            source=source,
+            thread_info=thread_info,
+            source_turn_id=source_turn_id,
+            plan_mode_confirmed=plan_mode_confirmed,
+            plan_generated_at=plan_generated_at,
+        )
+        existing_by_content = self.find_plan_by_content_hash(content_hash)
+        if existing_by_content is not None:
+            _, existing_meta = existing_by_content
+            merged_sources = self.merge_plan_sources([*existing_meta.get("sources", []), source_record])
+            self.plan_manifest[plan_hash] = {
+                "path": existing_meta.get("path"),
+                "paths": list(existing_meta.get("paths", [])),
+                "session_id": source.session_id,
+                "thread_name": thread_info.thread_name,
+                "source_kind": thread_info.source_kind,
+                "parent_thread_id": thread_info.parent_thread_id,
+                "agent_nickname": thread_info.agent_nickname,
+                "agent_role": thread_info.agent_role,
+                "source_turn_id": source_turn_id,
+                "plan_mode_confirmed": plan_mode_confirmed,
+                "plan_generated_at": source_record["plan_generated_at"],
+                "source_rollout": str(source.path),
+                "title": str(existing_meta.get("title") or extract_plan_title(normalized_body)),
+                "content_hash": content_hash,
+                "sources": merged_sources,
+            }
+            for meta in self.plan_manifest.values():
+                if isinstance(meta, dict) and meta.get("content_hash") == content_hash:
+                    meta["sources"] = merged_sources
             return
         title = extract_plan_title(plan_body)
         base_path = self.allocate_plan_base_path(title)
@@ -1157,7 +1509,7 @@ class CodexArchiveWatcher:
             "---\n",
             "\n",
         ]
-        paths = self.write_plan_content(base_path, "".join(front_matter) + plan_body.rstrip() + "\n")
+        paths = self.write_plan_content(base_path, "".join(front_matter) + normalized_body)
         for path_str in paths:
             set_file_timestamps(Path(path_str), generated_at)
         self.plan_manifest[plan_hash] = {
@@ -1174,6 +1526,8 @@ class CodexArchiveWatcher:
             "plan_generated_at": generated_at,
             "source_rollout": str(source.path),
             "title": title,
+            "content_hash": content_hash,
+            "sources": [source_record],
         }
 
     def write_thread_index(self, thread_registry: Dict[str, ThreadInfo]) -> None:
@@ -1211,11 +1565,13 @@ class CodexArchiveWatcher:
             if thread_info.parent_thread_id:
                 children_by_parent.setdefault(thread_info.parent_thread_id, []).append(session_id)
         payload = {
-            "generated_at": utc_now(),
             "threads": threads_payload,
             "children_by_parent": {key: sorted(value) for key, value in sorted(children_by_parent.items())},
         }
-        write_json(self.thread_index_path, payload)
+        existing = load_json(self.thread_index_path, None)
+        if existing is None or scrub_payload(existing, ("generated_at",)) != payload:
+            payload["generated_at"] = utc_now()
+            write_json(self.thread_index_path, payload)
 
     def audit_archive(self) -> int:
         thread_registry = self.load_thread_registry()
@@ -1296,7 +1652,7 @@ class CodexArchiveWatcher:
         if not any((missing_sessions, orphan_sessions, incomplete_sessions, missing_meta, parent_mismatches)):
             lines.extend(["Archive audit passed with no gaps detected.", ""])
 
-        self.archive_audit_report_path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(self.archive_audit_report_path, "\n".join(lines))
         return 1 if any((missing_sessions, orphan_sessions, incomplete_sessions, missing_meta, parent_mismatches)) else 0
 
     def audit_filenames(self) -> int:
@@ -1321,7 +1677,7 @@ class CodexArchiveWatcher:
             lines.append("")
         else:
             lines.extend(["All archived file names passed validation.", ""])
-        self.filename_audit_report_path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(self.filename_audit_report_path, "\n".join(lines))
         return 1 if invalid_paths else 0
 
     def repair_filenames(self) -> int:
@@ -1369,9 +1725,69 @@ class CodexArchiveWatcher:
         audit_after = self.audit_filenames()
         return 0 if audit_after == 0 else max(1, audit_before or changed)
 
+    def dedupe_plans_by_content(self) -> int:
+        documents: List[Tuple[Dict[str, Any], str, List[Path], str]] = []
+        for paths in self.plan_documents():
+            front_matter, plan_body = self.read_plan_document(paths)
+            normalized_body = normalize_plan_body(plan_body)
+            documents.append((front_matter, normalized_body, paths, self.compute_plan_content_hash(normalized_body)))
+
+        groups: Dict[str, List[Tuple[Dict[str, Any], List[Path]]]] = {}
+        for front_matter, _, paths, content_hash in documents:
+            groups.setdefault(content_hash, []).append((front_matter, paths))
+
+        changed = 0
+        for content_hash, items in groups.items():
+            if len(items) <= 1:
+                continue
+            items.sort(
+                key=lambda item: (
+                    str(item[0].get("plan_generated_at") or item[0].get("extracted_at") or ""),
+                    0 if str(item[0].get("source_kind") or "") == "main" else 1,
+                    "|".join(str(part) for part in plan_file_sort_key(item[1][0])) if item[1] else "",
+                )
+            )
+            _, canonical_paths = items[0]
+            canonical_set = {path.resolve() for path in canonical_paths}
+            for _, paths in items[1:]:
+                for old_path in paths:
+                    if old_path.resolve() not in canonical_set and old_path.exists():
+                        old_path.unlink()
+                        changed += 1
+            rename_pairs = preferred_plan_document_paths(canonical_paths)
+            if rename_pairs:
+                target_paths = [target for _, target in rename_pairs]
+                if all((not target.exists()) or target.resolve() in canonical_set for target in target_paths):
+                    renamed_paths: List[Path] = []
+                    for source, target in rename_pairs:
+                        if source.resolve() == target.resolve():
+                            renamed_paths.append(source)
+                            continue
+                        source.rename(target)
+                        renamed_paths.append(target)
+                        changed += 1
+                    canonical_paths[:] = renamed_paths
+        current_documents = list(self.plan_documents())
+        for paths in current_documents:
+            rename_pairs = preferred_plan_document_paths(paths)
+            if not rename_pairs:
+                continue
+            targets = [target for _, target in rename_pairs]
+            current_set = {path.resolve() for path in paths}
+            if not all((not target.exists()) or target.resolve() in current_set for target in targets):
+                continue
+            for source, target in rename_pairs:
+                if source.resolve() == target.resolve():
+                    continue
+                source.rename(target)
+                changed += 1
+        if changed:
+            self.rebuild_plan_manifest_from_files(save_if_changed=True)
+        return 0
+
     def verify_retention(self) -> int:
         if not self.plan_manifest:
-            self.retention_report_path.write_text("# Retention Audit\n\nNo plans recorded in manifest.\n", encoding="utf-8")
+            atomic_write_text(self.retention_report_path, "# Retention Audit\n\nNo plans recorded in manifest.\n")
             return 0
         source_hashes: Dict[str, set[str]] = {}
         missing: List[Tuple[str, Dict[str, Any]]] = []
@@ -1402,7 +1818,7 @@ class CodexArchiveWatcher:
             lines.append("")
         else:
             lines.extend(["All tracked plans are still discoverable from their source rollout files.", ""])
-        self.retention_report_path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(self.retention_report_path, "\n".join(lines))
         return 1 if missing else 0
 
     def extract_plan_hashes_from_rollout(self, rollout_path: Path) -> set[str]:
@@ -1501,6 +1917,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audit-archive", action="store_true", help="Audit whether all source sessions are archived completely")
     parser.add_argument("--audit-filenames", action="store_true", help="Audit archive file names for invalid characters")
     parser.add_argument("--repair-filenames", action="store_true", help="Repair invalid dynamic file names under the archive path")
+    parser.add_argument("--dedupe-plans-by-content", action="store_true", help="Collapse duplicate plan files that share the same body content")
     parser.add_argument("--rescan", action="store_true", help="Force a full rollout source rescan before processing")
     parser.add_argument("--verbose", action="store_true", help="Print runtime progress to stdout")
     return parser
@@ -1518,12 +1935,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.audit_archive,
             args.audit_filenames,
             args.repair_filenames,
+            args.dedupe_plans_by_content,
         )
     )
     if mode_count > 1:
         parser.error(
             "only one of --backfill-only, --follow-only, --verify-retention, --audit-archive, "
-            "--audit-filenames, or --repair-filenames may be set"
+            "--audit-filenames, --repair-filenames, or --dedupe-plans-by-content may be set"
         )
 
     watcher = CodexArchiveWatcher(
@@ -1553,6 +1971,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return watcher.audit_filenames()
     if args.repair_filenames:
         return watcher.repair_filenames()
+    if args.dedupe_plans_by_content:
+        return watcher.dedupe_plans_by_content()
 
     if args.follow_only:
         watcher.log("Follow-only mode: seeding existing sessions without re-exporting old content")

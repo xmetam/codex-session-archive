@@ -60,6 +60,7 @@ SQLite 状态库路径也可以通过参数覆盖：
 - 第一次建档时会做一次全量发现
 - 后续 `--backfill-only`、默认模式和 `--follow-only` 都会优先走结构化增量发现
 - 如果你怀疑有漏发现，或者本地 Codex 数据目录发生了手动迁移，再用 `--rescan`
+- 如果本轮没有任何实质性变化，脚本会尽量避免重写 `_state/sessions/*.json`、`transcript`、`manifest.json` 和 `thread_index.json`
 - 最近一次运行到底走了全量还是增量，会写入 `_state/manifest.json` 和 `reports/archive-audit.md`
 - 最近一次 SQLite 状态库读取是否成功、schema 是否兼容，也会写入这些状态文件
 
@@ -99,6 +100,9 @@ SQLite 状态库路径也可以通过参数覆盖：
 - 如果没有 `# Heading`，则取第一行非空文本
 - 文件名会自动清洗，移除如 `#`、反引号、Windows 非法字符等不规范内容
 - 重名文件会自动追加 `-2`、`-3`
+- 如果多个来源的计划正文完全相同，只保留 1 份 canonical `.md`
+- 其它来源信息保存在 `_state/plans.json`，不再额外生成同正文副本
+- 执行正文级去重时，如果只剩 `Title-2.md` 这类历史遗留文件且基础文件名空闲，脚本会自动回正为 `Title.md`
 
 计划文件 front matter 会记录：
 
@@ -244,13 +248,19 @@ python watch_codex_sessions.py --audit-filenames
 python watch_codex_sessions.py --repair-filenames
 ```
 
-### 10. 指定 Codex 数据目录和输出目录
+### 10. 按计划正文去重并清理历史重复文件
+
+```bash
+python watch_codex_sessions.py --dedupe-plans-by-content
+```
+
+### 11. 指定 Codex 数据目录和输出目录
 
 ```bash
 python watch_codex_sessions.py --codex-home ~/.codex --output-dir output/codex-archive
 ```
 
-### 11. 指定自定义 SQLite 状态库路径
+### 12. 指定自定义 SQLite 状态库路径
 
 ```bash
 python watch_codex_sessions.py --state-db-path ~/.codex/state_5.sqlite --backfill-only
@@ -349,6 +359,10 @@ python watch_codex_sessions.py --output-dir output/codex-archive --auto-git
 2. 用 `python watch_codex_sessions.py --follow-only --verbose` 看持续监听时的实时状态
 3. 查看 `output/codex-archive/_state/manifest.json`
 4. 查看 `output/codex-archive/reports/archive-audit.md`
+
+当前版本对 `manifest.json`、`plans.json`、session state、transcript 分片、plan 文件和审计报告都改成了“原子替换 + 短重试”写入，因此 Windows 上偶发的瞬时写入异常不太容易再留下半写入文件。如果只出现过一次类似报错，建议先直接重跑一次再判断是否存在持续性问题。
+
+如果之前某次中断运行留下了全 0 的 `manifest.json`、`meta.json` 或 transcript 分片，重新执行一次 `--backfill-only` 通常就可以基于底层 rollout JSONL 重新生成这些文件。若回填完成后仍残留同目录下的 `*.tmp` 临时文件，可以再手动清理。
 
 如果 SQLite 驱动的线程元数据缺失或质量下降，优先检查这些状态字段：
 

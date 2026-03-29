@@ -67,6 +67,7 @@ Operationally this means:
 - the first archive build is a full discovery pass
 - later runs prefer structured incremental discovery
 - `--rescan` is available when you suspect missing sources or moved local Codex data
+- no-op incremental runs try to avoid rewriting session state files, transcripts, `manifest.json`, or `thread_index.json` when nothing substantive changed
 
 The latest discovery mode and counters are recorded in:
 
@@ -116,6 +117,9 @@ Rules:
 - otherwise the first non-empty line is used
 - filenames are sanitized for Windows and GitHub-friendly usage
 - duplicate names receive `-2`, `-3`, and so on
+- plans with the same Markdown body are collapsed into one canonical `.md` file
+- additional source provenance is retained in `_state/plans.json`
+- the dedupe command also normalizes historical suffix-only leftovers such as `Title-2.md` back to `Title.md` when the base name is available
 
 Plan front matter includes:
 
@@ -234,6 +238,12 @@ Repair invalid dynamic filenames:
 python watch_codex_sessions.py --repair-filenames
 ```
 
+Collapse already-exported duplicate plan files that share the same body:
+
+```bash
+python watch_codex_sessions.py --dedupe-plans-by-content
+```
+
 Use a custom Codex home and output directory:
 
 ```bash
@@ -314,6 +324,10 @@ Recommended checks:
 2. Run `python watch_codex_sessions.py --follow-only --verbose` for an interactive watch session
 3. Inspect `output/codex-archive/_state/manifest.json` for the latest discovery and state-db fields
 4. Inspect `output/codex-archive/reports/archive-audit.md` for a summarized health snapshot
+
+The watcher now writes JSON state files, transcript chunks, plan files, and audit reports with an atomic replace flow plus short retries, so transient Windows file-write issues are less likely to leave partially written files behind. If you hit a write error once, rerun the command before assuming the archive state is corrupted.
+
+If a previous interrupted run left behind all-zero `manifest.json`, `meta.json`, or transcript chunk files, a fresh `--backfill-only` pass can rebuild them from the underlying rollout JSONL files. Temporary `*.tmp` files left beside archive outputs can be removed after the rerun completes successfully.
 
 If SQLite-backed thread metadata is missing or degraded, check these manifest and audit fields first:
 
